@@ -29,6 +29,7 @@ INSTALLED_APPS = [
     'drf_spectacular',
     'django_filters',
     'corsheaders',
+    'django_celery_beat',
     
     # Local apps
     'apps.users',
@@ -160,7 +161,7 @@ REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': (
         'rest_framework.renderers.JSONRenderer',
     ),
-    'EXCEPTION_HANDLER': 'apps.users.exceptions.custom_exception_handler',
+    'EXCEPTION_HANDLER': 'config.exceptions.custom_exception_handler',
     'DATETIME_FORMAT': '%Y-%m-%d %H:%M:%S',
     'DATE_FORMAT': '%Y-%m-%d',
 }

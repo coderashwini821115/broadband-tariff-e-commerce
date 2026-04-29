@@ -353,6 +353,117 @@ config/settings/
 
 ---
 
+### 5. Dockerfile vs docker-compose.yml — What's the Difference?
+
+| | Analogy | Purpose |
+|---|---|---|
+| **Dockerfile** | Recipe for a single dish | Builds **one image** — your Django app |
+| **docker-compose.yml** | Kitchen coordinator | Runs **multiple containers together** and wires them |
+
+#### Dockerfile = "How to build MY app image"
+```dockerfile
+FROM python:3.11          # start from this base image
+COPY . /app               # copy code into container
+RUN pip install -r requirements/dev.txt  # install dependencies
+```
+Result: a single Docker **image** of your Django app.
+
+#### docker-compose.yml = "Run ALL services together"
+Your app needs multiple services running simultaneously. docker-compose.yml defines all of them and handles the networking between them:
+
+```
+┌──────────────────────────────────────────────────┐
+│               docker-compose.yml                 │
+│                                                  │
+│  web     → Django (built from your Dockerfile)  │
+│  db      → PostgreSQL (official image)           │
+│  redis   → Redis (official image)                │
+│  celery  → Same Django image, different command  │
+└──────────────────────────────────────────────────┘
+```
+
+Without docker-compose, you'd have to start each container manually with long `docker run` commands and link them yourself.
+
+---
+
+### 6. How Docker Knows About Environment Variables (The Full Flow)
+
+There are **three layers** — each feeds the next.
+
+#### Layer 1 — `.env` file (secrets, per-developer config)
+```
+POSTGRES_DB=broadband_platform
+POSTGRES_PASSWORD=postgres
+ANTHROPIC_API_KEY=sk-ant-xxxx
+```
+
+#### Layer 2 — `docker-compose.yml` injects into the container
+
+Two different blocks, two different sources:
+
+```yaml
+# Reads ALL variables from .env file and injects into container
+env_file:
+  - .env
+
+# Hardcodes specific values directly (no .env needed)
+environment:
+  - DJANGO_SETTINGS_MODULE=config.settings.dev
+  - POSTGRES_HOST=db        # "db" = the Docker service name, not a real hostname
+  - POSTGRES_PORT=5432
+  - REDIS_URL=redis://redis:6379/1
+```
+
+**Why split?**
+- `.env` → secrets and per-developer values (passwords, API keys)
+- `environment:` block → Docker-network-specific values like `POSTGRES_HOST=db` (only meaningful inside Docker)
+
+Both end up in the container's OS environment. Django reads from the same place regardless.
+
+#### Layer 3 — Django `base.py` reads from the container's environment
+```python
+# base.py line 80-84
+DATABASES = {
+    'default': {
+        'NAME': os.environ.get('POSTGRES_DB', 'broadband_platform'),
+        'USER': os.environ.get('POSTGRES_USER', 'postgres'),
+        'PASSWORD': os.environ.get('POSTGRES_PASSWORD', 'postgres'),
+        'HOST': os.environ.get('POSTGRES_HOST', 'db'),
+        'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+    }
+}
+```
+
+`os.environ.get('POSTGRES_DB', 'broadband_platform')` means:
+- Look for `POSTGRES_DB` in the OS environment
+- If not found, use `'broadband_platform'` as the fallback default
+
+#### Complete flow visualized
+```
+.env file
+  └── POSTGRES_DB=broadband_platform
+        │
+        ▼
+docker-compose.yml  (env_file: .env  OR  environment: block)
+  └── injects into container's OS environment
+        │
+        ▼
+Django base.py
+  └── os.environ.get('POSTGRES_DB') → 'broadband_platform'
+        │
+        ▼
+PostgreSQL connection uses the correct database name
+```
+
+#### Rule of thumb
+| What | Where to put it |
+|------|----------------|
+| Secrets (passwords, API keys) | `.env` file via `env_file:` |
+| Docker network config (hostnames between services) | `environment:` block directly in compose |
+| Never | Hardcoded in Python source code |
+
+---
+
 ## AWS Concepts for Backend Development
 
 ### 1. Compute Services
@@ -615,3 +726,470 @@ config/settings/
   - Integrated with S3 and Lambda.
 
 ---
+
+## Django User Model Concepts
+
+### 1. Why CustomUser Instead of Django's Default User?
+
+This is one of the most important architectural decisions in any Django project. Django's built-in `User` model has several limitations that make it unsuitable for production apps.
+
+#### What Django's Default User Looks Like
+
+```python
+# Django's built-in User model (simplified)
+class User:
+    username    # ← login field  (we don't want this)
+    email       # ← optional, NOT unique by default
+    first_name  # ← split name fields
+    last_name
+    id          # ← auto-increment integer: 1, 2, 3...
+    is_staff    # ← boolean, no proper role system
+    is_superuser
+```
+
+For a production broadband platform, this has **five real problems**:
+
+---
+
+#### Problem 1 — Login with `username`, not `email`
+
+Every modern app (Netflix, Razorpay, JioFiber) uses **email as the login field**, not username.
+With the default User you'd have to work around it everywhere.
+With CustomUser you simply declare:
+
+```python
+USERNAME_FIELD = 'email'   # email IS the login field now
+```
+
+Django's entire auth system (login, JWT token generation, password reset) automatically uses `email` after this one line.
+
+---
+
+#### Problem 2 — `email` is not unique by default
+
+Django's default model allows **two users with the same email** — a bug waiting to happen in production.
+
+```python
+# CustomUser enforces uniqueness at the database level
+email = models.EmailField(unique=True)
+```
+
+---
+
+#### Problem 3 — Integer ID is a security leak
+
+Default `id` is `1, 2, 3...` — which leaks information:
+- Attackers can guess the total number of users from their own ID
+- URLs like `/api/users/1/` are trivially enumerable
+
+```python
+# CustomUser uses UUID — impossible to guess
+id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+# → 550e8400-e29b-41d4-a716-446655440000
+```
+
+UUID is the industry standard for production APIs.
+
+---
+
+#### Problem 4 — No proper role system
+
+Default User has `is_staff` and `is_superuser` booleans — not a proper role system.
+This platform needs:
+
+```python
+class Role(models.TextChoices):
+    CUSTOMER = 'customer', 'Customer'
+    ADMIN = 'admin', 'Admin'
+
+role = models.CharField(max_length=10, choices=Role.choices, default=Role.CUSTOMER)
+```
+
+This enables clean RBAC (Role-Based Access Control) in API permissions.
+
+---
+
+#### Problem 5 — You CANNOT change it after migrations exist
+
+This is the **biggest** reason to use CustomUser from day one.
+
+Django's official docs warn:
+
+> "Changing AUTH_USER_MODEL after you've created database tables is significantly more difficult since it affects foreign keys and many-to-many relationships."
+
+If you start with the default User and later want email login + UUIDs + roles, you'd need to **wipe your entire database and rebuild all migrations**. There is no clean migration path.
+
+**Rule: Always create a CustomUser at the start of every Django project, even if you don't need extra fields yet.**
+
+---
+
+#### Side-by-Side Comparison
+
+| Feature | Default `User` | `CustomUser` |
+|---|---|---|
+| Login field | `username` | `email` |
+| Email unique? | ❌ No | ✅ Yes (DB constraint) |
+| Primary key type | Integer (1, 2, 3) | UUID |
+| Role system | `is_staff` boolean | `role` field with `TextChoices` |
+| Extendable? | Painful after the fact | ✅ Full control from day one |
+| Change later? | Database nightmare | Already set up correctly |
+
+---
+
+#### How It's Registered in Settings
+
+```python
+# base.py line 94
+AUTH_USER_MODEL = 'users.CustomUser'
+```
+
+This single line tells Django:
+- Use `CustomUser` everywhere the auth system references a user
+- All ForeignKey relationships to User automatically point to `CustomUser`
+- `get_user_model()` returns `CustomUser` throughout the codebase
+
+Always use `get_user_model()` in your code, never import `CustomUser` directly — it keeps the code decoupled.
+
+```python
+# Correct — decoupled
+from django.contrib.auth import get_user_model
+User = get_user_model()
+
+# Avoid — tightly coupled
+from apps.users.models import CustomUser
+```
+
+---
+
+## Django Authentication Internals
+
+### 1. Password Hashing — How It Works
+
+You **never hash passwords manually** in Django. You call `user.set_password(raw_password)` and Django handles everything.
+
+#### What `set_password()` does internally
+
+```
+user.set_password('mypassword123')
+        ↓
+Django runs PBKDF2 algorithm:
+  - generates a unique random salt
+  - runs 600,000 iterations of SHA-256
+        ↓
+Stores this string in user.password column:
+  pbkdf2_sha256$600000$randomSalt$hashedValue==
+```
+
+The plain text password `'mypassword123'` is **never stored anywhere**. The DB only ever sees the hash.
+
+#### How login verification works
+
+When a user logs in:
+```python
+user.check_password('mypassword123')
+# → rehashes input using the same salt stored in DB
+# → compares result with stored hash
+# → True if match, False if not
+```
+
+The original password is never recovered — hashing is **one-way**.
+
+#### Why you must NOT hash manually
+
+```python
+# NEVER do this
+import hashlib
+user.password = hashlib.sha256('password').hexdigest()
+```
+
+Without a **unique random salt per user**, two users with the same password produce the same hash. An attacker with the hash table can crack all of them at once using a rainbow table.
+
+Django's `set_password()` generates a new random salt for each user — so even two users with identical passwords have completely different hashes in the DB.
+
+---
+
+### 2. `using=self._db` — Multi-Database Support
+
+```python
+user.save(using=self._db)
+```
+
+Django supports **multiple databases** configured in `settings.py`:
+
+```python
+DATABASES = {
+    'default': {...},    # main write database
+    'replica': {...},    # read-only replica
+    'analytics': {...},  # separate analytics database
+}
+```
+
+`using=` tells Django **which database** to write to.
+
+`self._db` is a property on the Manager that holds the name of the currently configured database. By default it resolves to `'default'`.
+
+#### `user.save()` vs `user.save(using=self._db)`
+
+```python
+user.save()                   # always writes to 'default' — hardcoded
+user.save(using=self._db)     # writes to whatever DB this manager is configured for
+```
+
+If you later call:
+```python
+User.objects.using('replica').create_user(...)
+```
+
+- With `self._db` → correctly saves to `'replica'`
+- With plain `save()` → silently ignores and saves to `'default'`
+
+It is a **future-proofing** pattern. Costs nothing now, prevents subtle bugs when read replicas are added in production.
+
+---
+
+### 3. `serializer.save()` vs `user.save()` — The Full Layer Chain
+
+Both `.save()` calls exist, but they operate at **completely different layers** and serve different purposes.
+
+#### The three-layer Django architecture
+
+```
+Layer 1 — View (HTTP)
+    Receives request, calls serializer
+
+Layer 2 — Serializer (Validation)
+    Validates data, calls manager
+
+Layer 3 — Manager (Database)
+    Builds user object, hashes password, writes to DB
+```
+
+#### The full call chain for user registration
+
+```
+POST /api/v1/auth/register/
+        ↓
+View: serializer.save()        ← triggers the chain
+        ↓
+Serializer: create(validated_data)
+    → calls User.objects.create_user(email, password)
+        ↓
+Manager: create_user(email, password):
+    email = self.normalize_email(email)
+    user  = self.model(email=email)   # build object in memory
+    user.set_password(password)       # hash password in memory
+    user.save(using=self._db)         # ← actual DB INSERT here
+        ↓
+Row written to PostgreSQL
+```
+
+#### Why each layer calls its own save
+
+| Call | Layer | What it does |
+|---|---|---|
+| `serializer.save()` | Serializer | Triggers `create()` or `update()` on the serializer |
+| `serializer.create()` | Serializer | Decides *how* to create — delegates to manager |
+| `User.objects.create_user()` | Manager | Handles business logic (normalize, hash) |
+| `user.save()` | Model/DB | Executes the SQL INSERT into PostgreSQL |
+
+**Analogy:**
+- `serializer.save()` = you hand a filled form to the clerk
+- `serializer.create()` = clerk reads the form and decides what to do
+- `create_user()` = clerk prepares the file correctly (stamps, signs)
+- `user.save()` = clerk files it into the cabinet (actual DB write)
+
+Each layer has one responsibility. The View never touches the DB. The Manager never parses HTTP.
+
+---
+
+### 4. `self.model` in the Manager
+
+```python
+user = self.model(email=email, **extra_fields)
+```
+
+`self.model` is set automatically by Django — it points to the model class the manager is attached to. Since `CustomUserManager` is assigned to `CustomUser` via `objects = CustomUserManager()`, `self.model` resolves to `CustomUser`.
+
+This means `self.model(email=email)` is equivalent to `CustomUser(email=email)` — but decoupled, so the same manager code works if the model is ever renamed or subclassed.
+
+---
+
+## 15. Docker Cheat Sheet
+
+### Common Lifecycle Commands
+
+| Command | Purpose | When to use |
+|---|---|---|
+| `docker compose up -d` | Start all services in the background | Daily start of development environment |
+| `docker compose up -d --build` | Rebuild images and start | After changing `requirements.txt` or `Dockerfile` |
+| `docker compose down` | Stop and remove all containers | End of the day/work session |
+| `docker compose ps` | List running containers and their status | To check if everything is healthy |
+| `docker compose logs -f web` | Follow (stream) logs for a specific service | To see Django output/errors in real-time |
+
+### Running Commands inside Containers
+
+#### 1. In a Running Container (Recommended)
+Use this if the `web` service is already running. It's faster and avoids entrypoint issues.
+```powershell
+docker exec -it broadband_web python manage.py createsuperuser
+```
+
+#### 2. In a New Temporary Container
+Use this if the services are stopped or if you need to bypass the default entrypoint.
+```powershell
+docker compose run --rm --entrypoint "" web python manage.py makemigrations
+```
+*Note: In PowerShell, use `''` (two single quotes) for the empty entrypoint string.*
+
+### Key Troubleshooting Concepts
+
+- **Volume Mounts (`.:/app`)**: Your local code is synced into the container. Most `.py` changes reflect instantly without a restart.
+- **Entrypoint Script**: Runs setup tasks (waiting for DB, running migrations) *before* the main command.
+- **Port Mapping (`8000:8000`)**: Maps `localhost:8000` on your Windows machine to port `8000` inside the Linux container.
+- **Vmmem / WSL**: The Windows process that manages the Linux VM where Docker runs. Limit its RAM via `.wslconfig` if needed.
+
+---
+
+## 16. DRF Routing: Routers vs. Manual Actions
+
+When working with `ModelViewSet` in Django REST Framework, there are two ways to connect your ViewSet to a URL: Using a **Router**, or manually extracting actions using **`.as_view()`**. Choosing between them depends on whether your URL represents a *Noun* (Resource) or a *Verb* (Action).
+
+### 1. The DefaultRouter (For Nouns / Resources)
+The standard way to wire a ViewSet is using a `DefaultRouter`. 
+
+```python
+router = routers.DefaultRouter()
+router.register('users', UserViewSet, basename='users')
+```
+
+**What it does:** The router automatically generates 5 standard REST endpoints based on the prefix you give it:
+* `GET /users/` $\rightarrow$ `list()`
+* `POST /users/` $\rightarrow$ `create()`
+* `GET /users/<id>/` $\rightarrow$ `retrieve()`
+* `PUT /users/<id>/` $\rightarrow$ `update()`
+* `DELETE /users/<id>/` $\rightarrow$ `destroy()`
+
+**When to use it:** Always use Routers when your endpoint represents a Resource (a noun), like `/products/`, `/users/`, or `/subscriptions/`. It is clean, automatic, and enforces strict RESTful standards.
+
+### 2. Manual Action Extraction via `.as_view()` (For Verbs / Actions)
+Sometimes, business requirements or frontend teams need a specific URL that is an *Action* (a verb), such as `/register/`, `/login/`, or `/checkout/`.
+
+If you try to use a Router for a verb (`router.register('register', UserViewSet)`), you will accidentally generate nonsensical endpoints like `GET /register/` (to list users) or `DELETE /register/<id>/` (to delete a user).
+
+To prevent this, you manually pluck out **only the specific action you need** and map it to your custom URL:
+
+```python
+path('register/', UserViewSet.as_view({'post': 'create'}), name='auth_register')
+```
+
+**What it does:** 
+1. The dictionary `{'post': 'create'}` translates the incoming HTTP method (`POST`) to the specific Python method inside your ViewSet (`create()`).
+2. It completely ignores all other actions (`list`, `destroy`, etc.), keeping the endpoint strictly limited to the one thing it was designed to do.
+
+**When to use it:** Use `.as_view()` when you need to expose a single action from a ViewSet under a highly specific, non-RESTful URL name (like `/register/`).
+
+---
+
+## 17. Authentication: Djoser vs. Custom Implementation
+
+When setting up JWT Authentication in Django, developers typically choose between using a pre-packaged library (like **Djoser**) or building the endpoints manually using **`djangorestframework-simplejwt`**.
+
+### 1. The Djoser Way (Startups & MVPs)
+Djoser acts as a massive pre-packaged bundle. By simply adding `path('auth/', include('djoser.urls.jwt'))` to your main `urls.py`, you instantly gain access to a full suite of pre-built endpoints (e.g., `/auth/users/` for registration, `/auth/jwt/create/` for login).
+
+*   **Pros:** Incredible speed. You can set up a full auth system in 5 minutes without writing any Serializers or Views.
+*   **Cons:** You are locked into their URL naming conventions and their exact flow. Customizing the registration process (like sending a welcome email or checking an external API) requires overriding their internal classes, which can become messy.
+
+### 2. The Custom Way (Enterprise & Scaling)
+In a production-grade or enterprise environment, engineering teams almost always build the auth flow manually using raw tools like `simplejwt`.
+
+*   **Strict API Contracts:** Frontend and mobile teams often require specific, immutable URL names (e.g., `POST /api/v1/auth/register/`). Building custom views allows 100% control over the routing namespace to meet these contracts.
+*   **Complex Business Logic:** "Registration" in enterprise apps is rarely just creating a database row. It often involves assigning default plans, triggering celery tasks (like welcome emails), assigning RBAC roles, or syncing with CRMs. Handling this in a custom `RegisterSerializer` keeps the logic clean and isolated.
+*   **Security Audits:** Owning the core code for user creation and token generation makes security reviews much more straightforward.
+
+**Summary:** Djoser is excellent for rapid prototyping, but manually wiring your serializers and views is the industry standard for production backends that require deep customization and strict API contracts.
+
+---
+
+## 18. Serializers vs. ModelSerializers
+
+When deciding which base class to use for validation in Django REST Framework, the choice depends entirely on whether you are interacting with a database table.
+
+### `serializers.ModelSerializer`
+*   **What it does:** Acts as a shortcut. It inspects a Django database Model and automatically copies its schema (fields like `email`, `phone_number`), preventing you from typing them manually.
+*   **When to use:** When you are saving, updating, or listing rows from a database table (e.g., `RegisterSerializer` maps to the `CustomUser` table).
+
+### `serializers.Serializer`
+*   **What it does:** Provides a blank canvas. It does not look at the database. You must explicitly define every field (e.g., `refresh = serializers.CharField()`).
+*   **When to use:** When you are accepting data from a user that does not map to a database Model. Examples include Search Queries, Password Reset confirmation codes, or Logout tokens.
+
+---
+
+## 19. Overriding Methods and `**kwargs`
+
+When overriding built-in framework methods (like `.save()`), you will often see `**kwargs` (Keyword Arguments) used in the method signature:
+`def save(self, **kwargs):`
+
+### Why is this necessary?
+When a framework like Django or DRF calls a method internally, it sometimes passes hidden arguments behind the scenes. For example, Django might call `serializer.save(commit=True)` or `serializer.save(update_fields=['email'])`.
+
+If you define your custom method as `def save(self):` without `**kwargs`, the moment Django tries to pass `commit=True`, your application will crash with a `TypeError: save() got an unexpected keyword argument`.
+
+By adding `**kwargs`, you are providing a safety net. You are telling Python: *"I don't care what extra keyword arguments the framework tries to pass to me. Just swallow them up silently in a dictionary so the code doesn't crash."*
+
+---
+
+## 20. JWT Statelessness and Token Blacklisting
+
+JSON Web Tokens (JWTs) are completely **stateless**. The server does not remember you. The math inside the token signature proves you are who you say you are. 
+
+Because of this, you cannot "log out" a user simply by destroying a session on the server (because no session exists).
+
+### How Logout / Blacklisting Works:
+To log out, the frontend deletes the short-lived Access Token, and sends the long-lived **Refresh Token** to the backend's `/logout/` endpoint.
+
+When the backend runs `token.blacklist()`:
+1. It extracts the unique cryptographic ID of that token (the `jti`).
+2. It physically creates a new row in a PostgreSQL database table named `token_blacklist_blacklistedtoken`.
+3. From that moment on, whenever anyone tries to use that Refresh Token to get a new Access Token, the server checks the database, sees the ID in the blacklist, and rejects the request.
+
+---
+
+## 21. Database Optimization: Partial Indexing
+
+A standard Database Index (like `db_index=True`) catalogs every single row in a table. In many production scenarios, this is a massive waste of resources.
+
+### What is Partial Indexing?
+Partial Indexing allows you to index only a subset of the rows in your table by defining a `condition`. For example:
+
+```python
+from django.db.models import Q
+
+class Meta: 
+    indexes = [
+        models.Index(
+            fields=['is_active'],
+            condition=Q(is_active=True),
+            name='idx_active_plans'
+        )
+    ]
+```
+
+### Why Partial Indexing is Highly Efficient:
+*   **Space Efficiency:** Instead of indexing 1,000,000 rows (both active and inactive), if only 10,000 are active, the index is 100x smaller.
+*   **Performance:** Smaller indexes easily fit into system memory (RAM). When an API endpoint queries for active records (e.g., `GET /api/v1/plans/`), PostgreSQL can scan this tiny, highly-optimized B-Tree blazingly fast.
+*   **Faster Writes:** When inactive records are created or updated, the database completely skips updating this index, saving CPU cycles and disk I/O.
+
+---
+
+## 22. Timestamps: `auto_now_add` vs. `auto_now`
+
+Django provides two convenient arguments for `DateTimeField` to automatically manage object lifecycles without writing manual datetime logic:
+
+### `auto_now_add=True` (Use for `created_at`)
+*   **How it works:** It sets the timestamp exactly **once**—the moment the row is first INSERTED into the database.
+*   **Behavior:** On any subsequent updates to the row, this field is completely ignored and remains untouched.
+
+### `auto_now=True` (Use for `updated_at`)
+*   **How it works:** It sets the timestamp **every single time** the `.save()` method is called on the object.
+*   **Behavior:** It intercepts the save operation and silently overwrites the field with the current system time, ensuring you always have a perfect log of the last modification.

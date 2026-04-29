@@ -23,6 +23,10 @@ while ! nc -z $REDIS_HOST $REDIS_PORT; do
 done
 echo "Redis is ready!"
 
+# Generate any missing migration files (dev only)
+echo "Generating migrations..."
+python manage.py makemigrations --noinput
+
 # Run database migrations
 echo "Running database migrations..."
 python manage.py migrate --noinput

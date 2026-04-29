@@ -16,6 +16,7 @@ hiredis==2.3.2
 # Celery for async tasks
 celery==5.3.6
 celery[redis]==5.3.6
+django-celery-beat==2.6.0
 
 # Payment Gateways
 razorpay==1.4.1

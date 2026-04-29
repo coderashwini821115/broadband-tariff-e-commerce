@@ -1,5 +1,8 @@
 -r base.txt
 
+# Celery monitoring
+flower==2.0.1
+
 # Development and debugging tools
 django-debug-toolbar==4.3.0
 django-extensions==3.2.3
