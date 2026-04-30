@@ -1193,3 +1193,47 @@ Django provides two convenient arguments for `DateTimeField` to automatically ma
 ### `auto_now=True` (Use for `updated_at`)
 *   **How it works:** It sets the timestamp **every single time** the `.save()` method is called on the object.
 *   **Behavior:** It intercepts the save operation and silently overwrites the field with the current system time, ensuring you always have a perfect log of the last modification.
+
+---
+
+## 23. Redis Caching, Databases, and Serialization (Pickling)
+
+When you use `django.core.cache`, Django automatically routes data to the caching engine defined in your `settings.py` (e.g., `django-redis`). This keeps your views cleanly decoupled from the actual infrastructure.
+
+### Redis Logical Databases
+Redis is not just a single bucket; it has 16 logical databases by default, numbered `0` to `15`.
+In a robust Django architecture:
+*   **Database `0`:** Typically used by Celery for message brokering and task queues (e.g., `_kombu` keys).
+*   **Database `1`:** Configured specifically for Django Caching (`redis://redis:6379/1`). This prevents your application cache from colliding with Celery queues.
+
+### How Data is Stored: Pickling vs. JSON
+When Django caches a Python dictionary or QuerySet, it does **not** store it as plain JSON. 
+Instead, it uses Python's native **Pickle** module to serialize the data into a binary stream.
+*   **Why?** JSON is extremely limited. It cannot serialize complex Python objects like `datetime` fields, sets, or Django Model instances. Pickling allows Django to store *any* Python object exactly as it is.
+*   **What it looks like:** In tools like Redis Commander, pickled data appears as "String (Binary)" gibberish mixed with keywords like `builtins.dict`.
+*   When `cache.get()` is called, Django pulls the binary blob and instantly un-pickles it back into a flawless Python dictionary.
+
+---
+
+## 24. Cache Invalidation in ViewSets
+
+Cache Invalidation is the process of deleting stale data from the cache so the system is forced to fetch fresh data from the database.
+
+In Django REST Framework's `ModelViewSet`, write operations are mapped to specific methods:
+*   `POST` (Create) triggers `perform_create()`
+*   `PUT/PATCH` (Update) triggers `perform_update()`
+*   `DELETE` (Destroy) triggers `perform_destroy()`
+
+By **overriding** these methods, you can inject cache invalidation logic exactly at the millisecond data changes:
+
+```python
+def perform_update(self, serializer):
+    # 1. Let the parent class handle the actual database save using super()
+    super().perform_update(serializer)
+    
+    # 2. Instantly wipe the stale Redis cache
+    self.clear_cache(serializer.instance)
+```
+
+**Understanding `super()`:** 
+Using `super()` is crucial. It tells Python to look at the parent class (`ModelViewSet`), find its original method, and execute it. This allows the framework to do the heavy lifting (validation, database writing). Calling `self.perform_update(serializer)` instead would cause infinite recursion and crash the server.
