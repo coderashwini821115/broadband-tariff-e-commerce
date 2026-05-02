@@ -77,10 +77,8 @@ class TariffPlanViewSet(ModelViewSet):
         cache_data = cache.get(cache_key)
 
         if cache_data is not None:
-            print('cache hit for retrieve', f' id is : {request.user.id}')
             return Response(cache_data)
 
-        print('cache miss')
         response = super().retrieve(request, *args, **kwargs)
         cache.set(cache_key, response.data, 3600)
         return response

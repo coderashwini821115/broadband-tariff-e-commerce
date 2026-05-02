@@ -6,10 +6,13 @@ from django.db import models
 
 # Create your models here.
 class CustomUser(AbstractBaseUser, PermissionsMixin):
-    ROLE_CHOICES = [
-        ('customer', 'Customer'),
-        ('admin', 'Admin')
-    ]
+    class RoleChoices(models.TextChoices):
+        CUSTOMER = 'customer', 'Customer'
+        ADMIN = 'admin', 'Admin'
+    # ROLE_CHOICES = [
+    #     ('customer', 'Customer'),
+    #     ('admin', 'Admin')
+    # ]
     id = models.UUIDField(primary_key = True, default = uuid.uuid4, editable = False)
     email = models.EmailField(unique = True)
     phone_number = models.CharField(max_length = 20, blank = True)
@@ -18,7 +21,7 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     updated_at = models.DateTimeField(auto_now=True)
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
-    role = models.CharField(max_length = 10, choices = ROLE_CHOICES, default = 'customer')
+    role = models.CharField(max_length = 10, choices = RoleChoices.choices, default = RoleChoices.CUSTOMER)
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = ['full_name']
     objects = CustomUserManager()

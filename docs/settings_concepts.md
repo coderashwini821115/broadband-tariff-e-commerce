@@ -1237,3 +1237,211 @@ def perform_update(self, serializer):
 
 **Understanding `super()`:** 
 Using `super()` is crucial. It tells Python to look at the parent class (`ModelViewSet`), find its original method, and execute it. This allows the framework to do the heavy lifting (validation, database writing). Calling `self.perform_update(serializer)` instead would cause infinite recursion and crash the server.
+
+---
+
+## 25. Python Sets and Time Complexity
+
+A **Set** in Python is an unordered collection of unique elements (duplicates are automatically removed). Under the hood, Python Sets are implemented as **Hash Tables**.
+
+### Time Complexity (Big O)
+Because they use Hash Tables, Sets are incredibly fast compared to Lists:
+*   **Lookup (`x in s`):** $O(1)$ (Instant math). A List is $O(N)$ (requires scanning every item).
+*   **Add/Remove:** $O(1)$.
+
+### The $O(N^2)$ Trap
+If you have a loop of 10,000 items, and inside that loop you do a lookup `if x in my_list`, the List scan takes up to 10,000 steps per loop. $10,000 \times 10,000 = 100,000,000$ steps ($O(N^2)$).
+If you convert the list to a Set first (`my_set = set(my_list)`), the lookup takes 1 step. $10,000 \times 1 = 10,000$ steps ($O(N)$). Always use Sets for lookups inside loops!
+
+### Sets and Caching
+JSON cannot serialize Python Sets. This is why Django uses **Pickle** (binary serialization) to store complex data structures in Redis.
+
+---
+
+## 26. Django TextChoices vs. Tuples
+
+Django 3.0 introduced `models.TextChoices` as the modern, Pythonic way to define choices, replacing the legacy list of tuples.
+
+**The Legacy Way:**
+```python
+ROLE_CHOICES = [('admin', 'Admin'), ('customer', 'Customer')]
+# Usage in code: if user.role == 'admin': (Vulnerable to typos like 'avtive')
+```
+
+**The Modern Way:**
+```python
+class RoleChoices(models.TextChoices):
+    ADMIN = 'admin', 'Admin'
+    CUSTOMER = 'customer', 'Customer'
+# Usage in code: if user.role == User.RoleChoices.ADMIN:
+```
+*   **Benefits:** IDE Auto-complete, prevention of typo-induced bugs (no "magic strings"), and a single source of truth for the underlying string value.
+
+---
+
+## 27. The N+1 Query Problem in `__str__`
+
+The `__str__` method is evaluated every time an object is printed or displayed, such as in the Django Admin panel. 
+If your `__str__` method crosses a foreign key relationship (e.g., `return self.user.email`), it creates a massive performance trap:
+
+*   Loading 50 Subscriptions in the Admin panel triggers 1 query.
+*   Evaluating `self.user.email` triggers 50 extra queries (one for each row).
+*   Evaluating `self.plan.name` triggers another 50 extra queries.
+This results in 101 queries for a single page!
+
+**The Fix:** Use `list_select_related = ['user', 'plan']` in your `admin.py`. This forces Django to perform an **SQL INNER JOIN**, fetching all 50 subscriptions and their related users/plans in exactly 1 single query.
+
+---
+
+## 28. Callables vs. Executing Functions
+
+When passing functions to Django Models or Celery Tasks, the distinction between a Callable and Executing is critical.
+
+### The Callable (No Parentheses): `default=timezone.now`
+You are passing the function itself (a "Recipe Card"). You are telling Django: *"Keep this function. Execute it yourself in the future whenever a new database row is inserted."*
+
+### Executing (With Parentheses): `start_date = timezone.now()`
+You are actively executing the function right now. If you accidentally use this in a Model definition (`default=timezone.now()`), the function runs exactly once when the server boots up, and every single row created all year will have the exact same timestamp!
+
+---
+
+## 29. Overriding `create()` in ModelSerializers
+
+A standard `Serializer` only converts JSON and validates it. However, a `ModelSerializer` is directly connected to a database table and handles the physical SQL `INSERT`/`UPDATE` operations via its `.save()` method.
+
+When you override `create(self, validated_data)`, you intercept the flow right after validation, but right before the SQL `INSERT`.
+```python
+def create(self, validated_data):
+    # 1. Modify the dictionary (e.g., inject calculated dates)
+    validated_data['end_date'] = timezone.now() + timedelta(days=30)
+    
+    # 2. Hand it back to the parent class to execute the SQL INSERT!
+    return super().create(validated_data)
+```
+If you forget `return super().create(validated_data)` and just return the dictionary, the SQL INSERT never happens, and your database remains empty.
+
+---
+
+## 30. ModelViewSet HTTP Routing and `perform_*` Hooks
+
+Django REST Framework's `ModelViewSet` automatically maps standard HTTP methods to internal Python class methods. 
+
+Here is the exact routing lifecycle when a request hits a `ModelViewSet`:
+
+*   **`GET /api/v1/plans/`** ➡️ `list()` *(Override this to cache the list response)*
+*   **`GET /api/v1/plans/<id>/`** ➡️ `retrieve()` *(Override this to cache the detail response)*
+*   **`POST /api/v1/plans/`** ➡️ `create()` ➡️ calls `perform_create()`
+*   **`PUT/PATCH /api/v1/plans/<id>/`** ➡️ `update()` ➡️ calls `perform_update()`
+*   **`DELETE /api/v1/plans/<id>/`** ➡️ `destroy()` ➡️ calls `perform_destroy()`
+
+### Why override `perform_create` instead of `create`?
+DRF explicitly splits the writing process into two steps to make your code cleaner:
+1.  **`create()`**: Handles the messy HTTP layer (parsing JSON, validating, returning the `201 Created` HTTP response).
+2.  **`perform_create()`**: A tiny helper function that solely runs `serializer.save()`.
+
+By overriding `perform_create`, you intercept the process *after* all the HTTP formatting is done but *before* the save happens. This makes it the perfect place to inject context (like the logged-in user) or trigger cache invalidations:
+
+```python
+def perform_create(self, serializer):
+    # Securely force the subscription to belong to the user making the request
+    serializer.save(user=self.request.user)
+    
+    # Wipe the cache now that data has changed
+    self.clear_cache()
+```
+
+---
+
+## 31. Attaching Users: ViewSet vs. Serializer Context
+
+When you need to attach the currently logged-in user to a newly created database row (e.g., creating a Subscription), there are two valid architectural approaches in Django REST Framework:
+
+### Approach A: The ViewSet Route (Recommended for Reusability)
+You pass the user explicitly in the ViewSet's `perform_create` method:
+`serializer.save(user=self.request.user)`
+*   **Pros:** Keeps the Serializer completely decoupled from HTTP Requests. If a background Celery worker or terminal script needs to create a Subscription later, it can safely use the `SubscriptionSerializer` without crashing.
+
+### Approach B: The Serializer Context Route
+You extract the user from the DRF context directly inside the Serializer's `create` method:
+`user = self.context['request'].user`
+*   **Pros:** Keeps the ViewSet 100% "thin" (routing only) and pushes all business logic into the Serializer.
+*   **Cons:** The Serializer is now strictly dependent on an HTTP Request existing. If called outside of an HTTP request, it will crash with a `KeyError`.
+
+---
+
+## 32. Serializer Overrides: `create()` vs. `save()`
+
+When customizing how data is saved in a `ModelSerializer`, you must decide whether to override `create()` or `save()`.
+
+### When to override `create(self, validated_data)`
+*   **Use Case:** Single-table operations where you just need to modify or inject data before it saves.
+*   **Why:** `ModelSerializer` has a highly optimized, bug-free internal `create` method. By overriding it, you can tweak the `validated_data` dictionary (e.g., calculating an `end_date`), and then call `return super().create(validated_data)` to let the framework do the heavy lifting of writing the SQL insert.
+
+### When to override `save(self, **kwargs)`
+*   **Use Case:** Massive, multi-table transactions (e.g., a Shopping Cart Checkout).
+*   **Why:** The default `ModelSerializer.create()` cannot handle creating Orders, mapping multiple CartItems to OrderItems, triggering signals, and managing Database Transactions. For complex, multi-model orchestrations, you must completely bypass the default routing by overriding `def save(self, **kwargs):` and writing the database logic manually.
+
+---
+
+## 33. Restricting ViewSets: Mixins vs. `http_method_names`
+
+If you inherit from `ModelViewSet`, DRF automatically exposes full CRUD operations (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`). To secure an endpoint and remove `PUT/PATCH/DELETE`, you have two architectural choices:
+
+### Approach A: The Mixins Route (The Gold Standard)
+Instead of `ModelViewSet`, you inherit from `GenericViewSet` and explicitly add only the mixins you want:
+```python
+class SubscriptionViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+```
+*   **Why it's better:** The code for `update()` and `destroy()` physically does not exist in your class. The ViewSet is lighter in memory, and auto-generated API documentation (Swagger/OpenAPI) will be 100% accurate because it can strictly guarantee those endpoints don't exist.
+
+### Approach B: Restricting HTTP Methods
+You keep `ModelViewSet` but restrict the allowed methods:
+```python
+http_method_names = ['get', 'post', 'head', 'options']
+```
+*   **Why it's used:** It is a quick one-liner. It intercepts disallowed requests and immediately returns a `405 Method Not Allowed` error. However, the update/destroy code remains in memory, and Swagger may occasionally incorrectly document them.
+
+---
+
+## 34. Custom Endpoints: The `@action` Decorator
+
+A `GenericViewSet` paired with a `DefaultRouter` is programmed to strictly understand standard CRUD operations. If you write a custom Python method (e.g., `def cancel(self, request):`), the router will ignore it.
+
+The `@action` decorator is how you communicate with the router to generate a non-standard endpoint:
+```python
+@action(detail=True, methods=['post'])
+def cancel(self, request, pk=None):
+```
+*   **`detail=True`:** Tells the router this action applies to a *specific* instance. It generates: `/subscriptions/<id>/cancel/`.
+*   **`detail=False`:** Tells the router this action applies to the entire collection. It generates: `/subscriptions/cancel/`.
+
+---
+
+## 35. Permissions: Static Attributes vs. Dynamic Methods
+
+Applying permissions in DRF relies heavily on the concept of Callables (Recipe Cards) vs Executing (Baking the Cake):
+
+### 1. Static Attribute (`permission_classes`)
+```python
+permission_classes = [IsAuthenticated]
+```
+When defined as a class attribute, you must pass the **Callable Class** (no parentheses). DRF loops through this list on every incoming request and instantiates the classes itself. If you passed `[IsAuthenticated()]`, DRF would attempt to instantiate an already instantiated object, causing a crash.
+
+### 2. Dynamic Method (`get_permissions`)
+```python
+def get_permissions(self):
+    return [IsAuthenticated()]
+```
+When returning permissions dynamically from a function, you are bypassing DRF's automatic instantiation step. Therefore, you must execute the class yourself (**with parentheses**) and return the fully instantiated object.
+
+---
+
+## 36. Django Threading vs. Synchronous Execution
+
+A common misconception is that because Django uses threads, database operations are non-blocking. This confuses **Thread Context Switching** (OS level) with **Asynchronous Execution** (Code level).
+
+### 1. The Server Level (Concurrent via Threads)
+When running Django via Gunicorn, the server spins up multiple worker threads. When User A triggers a database `.save()`, Thread 1 sits idle waiting for PostgreSQL to respond. The Operating System detects this idle state and performs a **Context Switch**, putting Thread 1 to sleep and assigning CPU power to Thread 2 to serve User B. Because of this, the server can handle many concurrent users without freezing.
+
+### 2. The Code Level (Synchronous/Blocking)
+However, from the perspective of User A and the specific Python code in Thread 1, `.save()` is strictly **Synchronous (Blocking)**. The Python code completely halts on that line and will not execute the next line of code until PostgreSQL replies. If the database takes 5 seconds, User A's browser will hang for 5 seconds. This is why slow tasks (like sending emails) are offloaded to Celery workers, ensuring the API response returns instantly.
