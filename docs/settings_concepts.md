@@ -1445,3 +1445,84 @@ When running Django via Gunicorn, the server spins up multiple worker threads. W
 
 ### 2. The Code Level (Synchronous/Blocking)
 However, from the perspective of User A and the specific Python code in Thread 1, `.save()` is strictly **Synchronous (Blocking)**. The Python code completely halts on that line and will not execute the next line of code until PostgreSQL replies. If the database takes 5 seconds, User A's browser will hang for 5 seconds. This is why slow tasks (like sending emails) are offloaded to Celery workers, ensuring the API response returns instantly.
+
+---
+
+## 37. `@staticmethod` and Service Layers
+
+In Python, class methods normally require the `self` parameter so they can access the specific instance of the class. To call a normal method, you must instantiate the class first: `service = PaymentService(); service.create_order()`.
+
+The `@staticmethod` decorator tells Python that the method does NOT need access to `self`. It behaves exactly like a floating function, but it is housed inside a class purely for organizational purposes. This allows you to call the method directly on the class without instantiating it: `PaymentService.create_order()`.
+
+### Why use it in Django?
+In Enterprise Django architecture (like the **Service Layer** pattern), we want to keep our `views.py` "skinny" by extracting heavy business logic (like calling the Razorpay API) into a separate `services.py` file. Instead of having hundreds of loose floating functions in that file, we group related functions into classes (like `PaymentService` or `InvoiceService`). Because these functions just process data and don't need to maintain "state" (like a normal object would), we mark them as `@staticmethod`s to make the code cleaner and easier to call.
+
+---
+
+## 38. Idempotency Keys (SHA-256)
+
+**Idempotency** is a mathematical property where an operation can be applied multiple times without changing the result beyond the initial application. In payments, this is a critical safety net.
+
+### The Implementation
+We generate a unique hash (SHA-256) based on a combination of stable data:
+```python
+raw_string = f"{user.id}-{subscription_id}-{today_date}"
+idem_key = hashlib.sha256(raw_string.encode()).hexdigest()
+```
+*   **Why Hashing?** It converts readable data into a fixed-length string that cannot be reversed.
+*   **Why the Date?** By including the date, we allow the user to try again tomorrow if their payment fails today, but block them from double-paying on the *same* day.
+*   **The Check:** Before calling the Payment Gateway (Razorpay/Stripe), we check if a `Payment` record with this `idempotency_key` already exists in our database. If it does, we simply return the existing order instead of creating a new one.
+
+---
+
+## 39. Locking: Pessimistic vs. Optimistic
+
+When two requests hit the database at the exact same time to modify the same record, we have a **Race Condition**.
+
+### 1. Optimistic Locking
+Assumes conflicts are rare. It uses a "version" number.
+*   **How it works:** "Update this row ONLY IF the version is still 1."
+*   **Outcome:** If someone else updated it first, the second request **crashes** with an error.
+*   **Best for:** Wikipedia, Google Docs, Profile updates (Read-heavy, low-stakes).
+
+### 2. Pessimistic Locking (`select_for_update`)
+Assumes conflicts will happen and takes them seriously.
+*   **How it works:** "Lock this row. Anyone else who tries to read/write it must wait in line until I'm finished."
+*   **Outcome:** The second request is **delayed** by a few milliseconds instead of crashing.
+*   **Best for:** Payments, Bank Transfers, Inventory management (High-stakes, zero-error tolerance).
+
+### Why Pessimistic is better for Payments
+While Optimistic locking technically "works" (it prevents the double-update), it does so by **crashing** the second request with an error. 
+1.  **Optimistic:** If two webhooks hit at once, the second one fails with a `500 Server Error`. This triggers the payment gateway (Razorpay) to start a retry cycle, meaning the user's subscription might stay "Pending" for 5 more minutes until the next retry. It also clutters your logs with fake errors.
+2.  **Pessimistic:** The second webhook simply pauses for a split second, then completes successfully with a `200 OK`. The user gets an "Active" subscription instantly, and your logs stay clean.
+
+
+---
+
+## 40. Webhooks and Signature Verification
+
+A **Webhook** is an "Inverse API." Instead of our server calling Razorpay, Razorpay's server calls ours.
+
+### Signature Verification
+Because our webhook endpoint is public (unauthenticated), anyone could send a fake POST request to `/webhook/` saying "Payment Successful."
+To prevent this, we use **Signature Verification**:
+1. Razorpay takes the raw request body and "signs" it using a secret key only we and Razorpay know.
+2. They send this signature in the headers (`X-Razorpay-Signature`).
+3. Our server re-calculates the signature using our secret and the raw body.
+4. If they match, we know the request is 100% authentic.
+
+---
+
+## 41. Distributed Consistency and Retries
+
+In a modern app, your data lives in two places: Your Database and the Payment Gateway's Database. Ensuring they stay in sync is called **Distributed Consistency**.
+
+### What if the Webhook fails?
+If our database crashes while processing a success webhook:
+1. Our server returns a `500 Server Error` to Razorpay.
+2. Razorpay has a built-in **Retry Logic** with exponential backoff.
+3. They will automatically try sending the webhook again 5 minutes later, then 30 minutes, then 2 hours.
+4. Eventually, when our database is back up, one of these retries will succeed, and the subscription will finally turn `ACTIVE`.
+
+This combination of **Atomic Transactions** (rolling back partial saves) and **Third-Party Retries** ensures that we never lose a payment even during a server crash.
+
