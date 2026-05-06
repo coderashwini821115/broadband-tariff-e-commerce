@@ -31,7 +31,7 @@ class Payment(models.Model):
     gateway_order_id = models.CharField(max_length = 255, null = True, blank = True)
 
     # Razorpay 'pay_xxx' or Stripe 'ch_xxx' (Created after successful payment)
-    gateway_payment_id = models.CharField(max_length = 255, unique = True, blank = True)
+    gateway_payment_id = models.CharField(max_length = 255, unique = True, null = True, blank = True, default=None)
 
     # Prevents double-charging if the user double-clicks the Pay button
     idempotency_key = models.CharField(max_length = 255, unique = True)

@@ -1526,3 +1526,224 @@ If our database crashes while processing a success webhook:
 
 This combination of **Atomic Transactions** (rolling back partial saves) and **Third-Party Retries** ensures that we never lose a payment even during a server crash.
 
+---
+
+## 42. Celery: `@app.task` vs `@shared_task`
+
+There are two ways to register a Celery task:
+
+### `@app.task` — Tight Coupling
+```python
+from config.celery import app  # Direct import of the Celery instance
+
+@app.task
+def generate_invoice(...):
+    ...
+```
+This works, but your `billing` app now has a hard dependency on `config/celery.py`. If you move `billing` to a different project, this import breaks immediately.
+
+### `@shared_task` — Loose Coupling ✅
+```python
+from celery import shared_task
+
+@shared_task
+def generate_invoice(...):
+    ...
+```
+`@shared_task` does not import or care about which Celery app instance exists. It simply registers the function as "available to be claimed by whatever Celery app starts up." When your Django project boots, `config/celery.py` initializes the main Celery app and automatically claims all `@shared_task` functions.
+
+**Rule:** Every reusable Django app (`billing`, `notifications`, etc.) should always use `@shared_task`. Only the top-level `config/` layer should know about the Celery app instance.
+
+| | `@app.task` | `@shared_task` |
+|---|---|---|
+| **Coupling** | Tightly coupled to one project | Fully portable, reusable |
+| **Best for** | One-off scripts in `config/` | Any reusable Django app |
+| **Analogy** | Full-time employee | Contractor (works for anyone) |
+
+---
+
+## 43. Celery: `.delay()` — Firing Async Tasks
+
+When you define a `@shared_task`, you have two ways to call it:
+
+### Direct Call (Synchronous — Blocks the API)
+```python
+generate_invoice(user_id, payment_id, ...)
+# Runs here, right now, in this thread.
+# API response is delayed until this finishes!
+```
+
+### `.delay()` (Asynchronous — Non-blocking ✅)
+```python
+generate_invoice.delay(user_id, payment_id, ...)
+# Serializes the arguments and drops a message into Redis instantly.
+# Returns immediately. The API response is NOT delayed.
+# A Celery worker picks up the message in the background.
+```
+
+`.delay()` is shorthand for `.apply_async()`. Use it every time you want to run a task in the background without blocking the HTTP response.
+
+---
+
+## 44. Celery: JSON Serialization — Why We Pass `str()` for Decimal and UUID
+
+Celery serializes task arguments into **JSON** before placing them in Redis. This means every argument must be JSON-compatible. Python has two common types that are **NOT** JSON-serializable by default:
+
+*   **`UUID`**: `uuid.UUID('550e8400...')` → Fails. Must convert to `str('550e8400...')`
+*   **`Decimal`**: `Decimal('999.99')` → Fails. Must convert to `str('999.99')`
+
+```python
+# ❌ This will raise: Object of type UUID is not JSON serializable
+generate_invoice.delay(
+    user_id=payment.user_id,  # UUID object
+    amount=payment.amount,    # Decimal object
+)
+
+# ✅ Correct: convert to string before passing to Celery
+generate_invoice.delay(
+    user_id=str(payment.user_id),
+    amount=str(payment.amount),
+)
+```
+
+The receiving task simply gets a string. Since the task is creating a database record, Django's ORM will automatically convert the string back to the correct type (UUID or Decimal) when saving.
+
+---
+
+## 45. Celery: Loosely Coupled Tasks (Primitive-Only Arguments)
+
+The most important architectural rule for Celery tasks is: **never pass Django model objects as arguments.**
+
+### Why?
+Celery serializes arguments into JSON and places them in Redis. Django model objects cannot be serialized. Even if you found a workaround, the object could become **stale** — the Celery worker might pick up the task 30 seconds later, by which time the database row has already changed!
+
+### The Rule
+Only pass **primitive data types**: `str`, `int`, `float`, `bool`, `list`, `dict`.
+
+```python
+# ❌ Wrong — passing model objects
+generate_invoice.delay(payment=payment_obj, subscription=subscription_obj)
+
+# ✅ Correct — passing only IDs and primitive values
+generate_invoice.delay(
+    user_id=str(payment.user_id),
+    payment_id=str(payment.id),
+    subscription_id=str(payment.subscription_id),
+    amount=str(payment.amount),
+    billing_period_start=str(subscription.start_date),
+    billing_period_end=str(subscription.end_date),
+)
+```
+
+This also enforces the **loose coupling** principle — the `billing` task knows nothing about the `Payment` or `Subscription` models. It just receives numbers and strings, creates its own `Invoice`, and does its job. Tomorrow, if you replace Razorpay with Stripe, the billing task doesn't change at all.
+
+---
+
+## 46. Celery `current_app.send_task()` — Decoupled Task Firing
+
+When two Django apps are in the same monolith, the natural impulse is to import directly:
+```python
+from ..billing.tasks import generate_invoice
+generate_invoice.delay(...)  # Direct import — tight coupling!
+```
+This works, but creates a hard dependency. The `payments` app now cannot exist without the `billing` app.
+
+**The decoupled alternative using `current_app.send_task()`:**
+```python
+from celery import current_app
+
+current_app.send_task(
+    'apps.billing.tasks.generate_invoice',  # just a string — no import!
+    kwargs={ 'user_id': '...', 'amount': '...' }
+)
+```
+The **string name is the contract**. The payments app fires a message with a name into Redis. The billing Celery worker, which has registered that name via `@shared_task`, picks it up and executes it. The two apps never directly import each other.
+
+This makes the code **structurally identical to Kafka** — payments just publishes an event by name, and billing reacts independently.
+
+---
+
+## 47. Kafka vs Celery+Redis — When to Use Which
+
+Both Kafka and Celery+Redis are message-passing systems, but they serve different scales and architectural needs.
+
+### Celery + Redis (Monolith / Small Team)
+```
+Payment Service (Django)
+    └── .delay() → Redis List → Celery Worker (billing/tasks.py)
+```
+*   **Best for:** Background jobs within a single Django project.
+*   **Limits:** Only one consumer per message. Messages disappear once consumed. No replay.
+
+### Kafka (True Microservices / Large Teams)
+```
+Payment Service
+    └── kafka_producer.send('payment-events', {...})
+              │
+              ├── Billing Service (Python) — generates invoice
+              ├── Notifications Service (Node.js) — sends email
+              └── Analytics Service (Go) — logs to data warehouse
+```
+*   **Best for:** Multiple independent services consuming the same event.
+*   **Advantages:** Message replay (stored for days), multiple consumer groups, millions of messages/second.
+
+| Feature | Celery + Redis | Kafka |
+|---|---|---|
+| **Cross-service** | ❌ Single consumer | ✅ Unlimited consumers |
+| **Message replay** | ❌ Gone once consumed | ✅ Stored for days |
+| **Throughput** | Thousands/sec | Millions/sec |
+| **Complexity** | Simple | Complex (needs KRaft/Zookeeper) |
+| **Best for** | Background jobs in one project | Event bus across independent teams |
+
+**Rule of thumb:** Use Celery+Redis until you have multiple teams deploying independent services. Then migrate to Kafka.
+
+---
+
+## 48. Service Boundary Rule — Split by Team, Not by Feature
+
+A common mistake is splitting microservices by technical function (e.g., separating "payments" and "billing" just because they sound different).
+
+**The correct rule:** Split services by **team boundary** — i.e., do two different teams need to deploy this code independently without stepping on each other?
+
+If one team owns both payment processing AND invoice generation, keeping them in a single Django project with Celery is the right call. Adding a network boundary (microservice split) between them only adds latency, distributed transaction complexity, and operational overhead — with no benefit to a single team.
+
+Companies like **Stripe** keep payment processing and billing in the same internal service. The split happens at the customer-facing API level, not internally.
+
+### The Cost of Premature Microservice Splits
+*   Every cross-service call adds 5-50ms of network latency.
+*   A database transaction spanning two services requires the **Saga Pattern** (complex compensating transactions) instead of a simple `transaction.atomic()`.
+*   Debugging is 10x harder — a single request now spans multiple logs, multiple services, and requires distributed tracing (Jaeger, Zipkin).
+
+---
+
+## 49. Redis Internals — How Celery Stores Tasks
+
+When `generate_invoice.delay(...)` is called, Celery does NOT use a simple Redis `SET key value`. It uses a **Redis List** as a queue, which is a FIFO (First In, First Out) data structure.
+
+### The Write (Producer side)
+```
+generate_invoice.delay(...) 
+    → RPUSH celery <json_message>
+```
+Celery calls `RPUSH` to append a JSON message to the right end of the Redis List named `"celery"`:
+```json
+{
+    "id": "a3f9b2c1-...",
+    "task": "apps.billing.tasks.generate_invoice",
+    "kwargs": { "user_id": "abc-123", "amount": "999.00", ... },
+    "retries": 0
+}
+```
+
+### The Read (Celery Worker side)
+```
+Celery Worker → BLPOP celery 0
+```
+The Celery worker runs `BLPOP` (Blocking Left Pop) in an infinite loop. It blocks indefinitely until a message is pushed. The moment `.delay()` pushes a message, `BLPOP` unblocks, pops the message from the left end of the list, and executes the task.
+
+### Inspecting the Queue Live
+```bash
+docker exec -it broadband_redis redis-cli
+> LLEN celery          # how many tasks are waiting
+> LRANGE celery 0 -1   # show all pending task messages
+```

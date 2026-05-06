@@ -1,3 +1,4 @@
+from ..billing.tasks import generate_invoice
 from django.db import transaction
 import json
 from ..subscriptions.models import Subscription
@@ -102,5 +103,16 @@ class PaymentService:
                     subscription = Subscription.objects.get(id = payment.subscription_id)
                     subscription.status = Subscription.StatusChoices.ACTIVE
                     subscription.save()
+
+                    # Fire the celery task (runs in background, doesn't block)
+                    generate_invoice.delay(
+                        user_id = str(payment.user_id),
+                        payment_id=str(payment.id),
+                        subscription_id=str(payment.subscription_id),
+                        amount=str(payment.amount),       # str() because Decimal is not JSON-serializable!
+                        currency=payment.currency,
+                        billing_period_start=str(subscription.start_date),
+                        billing_period_end=str(subscription.end_date),
+                    )
 
         return True
