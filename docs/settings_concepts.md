@@ -1348,7 +1348,45 @@ def perform_create(self, serializer):
     
     # Wipe the cache now that data has changed
     self.clear_cache()
+
+### The Exact Internal Chain for a POST Request
+
 ```
+POST /api/v1/plans/
+      │
+      ▼
+create(request)                       ← handles ALL the HTTP stuff
+  ├── deserializes JSON body
+  ├── calls serializer.is_valid()
+  ├── calls perform_create(serializer) ← YOU override this for extra logic
+  │       └── serializer.save()        ← triggers Model.objects.create() → DB INSERT
+  └── returns 201 Created response
+```
+
+If you override `create()` instead, you have to manually re-implement status codes, serializer validation, and the HTTP response. `perform_create` is the surgical insertion point that keeps your code clean.
+
+### `.save()` vs `.objects.create()` — When to Call Which?
+
+**Path A — Through the Serializer (ViewSet flow):**
+```python
+# DRF calls this internally — you never call .save() yourself
+serializer.save()
+# → triggers serializer's create() → Model.objects.create() → DB INSERT
+```
+
+**Path B — Direct ORM (Celery task / service layer):**
+```python
+Invoice.objects.create(user_id=..., amount=...)
+# → goes DIRECTLY to DB — DO NOT call .save() after this!
+```
+
+`objects.create()` is `Model(**data)` + `.save()` combined into one call.
+
+| Where | Method | Call `.save()` after? |
+|---|---|---|
+| Celery task / service | `Model.objects.create(...)` | ❌ No — already included |
+| Celery task / service | `invoice = Invoice(**data)` | ✅ Yes — must call manually |
+| ViewSet | `serializer.save()` | ❌ No — DRF handles it |
 
 ---
 
